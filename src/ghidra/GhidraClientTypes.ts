@@ -14,6 +14,8 @@ export type GhidraStartResult = Result<GhidraSessionInfo, GhidraSessionError>;
 /** Cancellation and deadline controls shared by authenticated requests. */
 export interface GhidraRequestOptions {
   readonly decompileTimeoutSeconds?: number | null;
+  /** One isolated Java regex operation; never a transport/session deadline. */
+  readonly regexMatchingDeadlineMs?: number;
   readonly signal?: AbortSignal;
   /** Internal startup/shutdown deadline; analysis calls have no fixed deadline. */
   readonly timeoutMs?: number;

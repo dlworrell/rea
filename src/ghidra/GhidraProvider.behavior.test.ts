@@ -1,5 +1,7 @@
 import { z } from "zod";
 import { GHIDRA_LITERAL_CANDIDATES_LIMITATION } from "./GhidraLiteralSearch.js";
+import { AnalysisSettings } from "../application/AnalysisSettings.js";
+import { runtimeAnalysisConfig } from "../config/runtimeAnalysisSettings.js";
 import {
   EXISTING_PROJECT_WINDOWS_REMEDIATION,
   EXISTING_PROJECT_WINDOWS_UNAVAILABLE,
@@ -1939,6 +1941,21 @@ describe("Ghidra failures during cancellation cleanup", () => {
         message:
           "Ghidra's Java regex engine exhausted its stack while matching pattern (a+)+$.",
       },
+      {
+        remoteCode: "regex_timeout",
+        projectedCode: "provider_timeout",
+        message: "Ghidra regex search exceeded its 5000 ms deadline",
+      },
+      {
+        remoteCode: "regex_worker_failed",
+        projectedCode: "execution_failure",
+        message: "Ghidra regex worker exited unexpectedly",
+      },
+      {
+        remoteCode: "regex_worker_memory_exhausted",
+        projectedCode: "resource_constraint",
+        message: "Ghidra regex worker reported memory exhaustion",
+      },
     ].flatMap((entry) => [
       { ...entry, cancelled: false, cleanupFailed: false },
       { ...entry, cancelled: true, cleanupFailed: false },
@@ -1978,12 +1995,14 @@ describe("Ghidra failures during cancellation cleanup", () => {
         { REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS: "5" },
       );
       const client = await createElfClient(ghidra);
-      const result =
-        remoteCode === "regex_stack_exhausted"
-          ? await client.execute("search_procedures", { pattern: "(a+)+$" })
-          : await client.execute("procedure_pseudo_code", {
-              procedure: "main",
-            });
+      const result = remoteCode.startsWith("regex_")
+        ? await client.execute("search_procedures", {
+            pattern: "(a+)+$",
+            mode: "regex",
+          })
+        : await client.execute("procedure_pseudo_code", {
+            procedure: "main",
+          });
       if (result.ok) throw new Error("Expected the observed remote failure");
       const projected = projectAnalysisError(result.error);
       expect(projected.code).toBe(
@@ -2003,7 +2022,7 @@ describe("Ghidra failures during cancellation cleanup", () => {
         expect(invocation).not.toContain(retained);
       if (!cancelled) {
         expect(projected.message).toContain(
-          remoteCode === "regex_stack_exhausted"
+          remoteCode.startsWith("regex_")
             ? "remain available"
             : "remains usable",
         );
@@ -6494,5 +6513,145 @@ describe("Windows Ghidra readiness repair", () => {
         reason: EXISTING_PROJECT_WINDOWS_UNAVAILABLE,
         remediation: EXISTING_PROJECT_WINDOWS_REMEDIATION,
       });
+  });
+});
+
+describe("Ghidra isolated regex deadline", () => {
+  it.each(["search_strings", "search_procedures"] as const)(
+    "%s retains its accepted budget across updates and permits another search",
+    async (operation) => {
+      const environment = {
+        GHIDRA_INSTALL_DIR: INSTALL,
+        REA_REGEX_MATCHING_DEADLINE_MS: "23",
+      };
+      const parsed = parseConfig(environment);
+      if (!parsed.ok) throw parsed.error;
+      const settings = new AnalysisSettings(environment);
+      const seen: (number | undefined)[] = [];
+      let first = true;
+      const ghidra = new GhidraProvider(
+        runtimeAnalysisConfig(parsed.value, settings.read),
+        silentLogger,
+        {},
+        installationHost(),
+        () => ({
+          start: async () => ok(sessionInfo()),
+          callTool: async (_operation, _input, options) => {
+            seen.push(options?.regexMatchingDeadlineMs);
+            if (!first) return ok([]);
+            first = false;
+            expect(
+              settings.update({
+                changes: [
+                  {
+                    setting: "regex.matching_deadline_ms",
+                    action: "set",
+                    value: 71,
+                  },
+                ],
+              }).ok,
+            ).toBe(true);
+            return err(
+              new GhidraSessionError(
+                "remote",
+                "Ghidra regex search exceeded its 23 ms deadline",
+                { remote_code: "regex_timeout" },
+                { remoteCode: "regex_timeout" },
+              ),
+            );
+          },
+          close: async () => ok(null),
+        }),
+      );
+      const client = await createElfClient(ghidra);
+      try {
+        const failed = await settings.run(() =>
+          client.execute(operation, {
+            pattern: "(a+)+$",
+            mode: "regex",
+          }),
+        );
+        if (failed.ok) throw new Error("Expected the regex deadline");
+        const projected = projectAnalysisError(failed.error);
+        expect(projected).toMatchObject({
+          code: "provider_timeout",
+          details: {
+            diagnostics: {
+              regex_matching_deadline_ms: 23,
+              regex_matching_deadline_source: "setting",
+            },
+            limit: {
+              setting: "regex.matching_deadline_ms",
+              effective_value: 23,
+              source: "setting",
+            },
+          },
+        });
+        expect(projected.message).toContain(GHIDRA_ANNOTATIONS_RETAINED);
+        expect(projected.remediation.action).toContain(
+          "update_analysis_settings",
+        );
+        const invocation = projectAnalysisError(failed.error, "invocation");
+        expect(invocation.message).not.toContain(GHIDRA_ANNOTATIONS_RETAINED);
+        expect(invocation.remediation.action).not.toContain(
+          "update_analysis_settings",
+        );
+        expect(invocation).toMatchObject({
+          details: {
+            limit: {
+              applies_at: "next_invocation",
+              environment: "REA_REGEX_MATCHING_DEADLINE_MS",
+            },
+          },
+        });
+        expect(
+          (
+            await settings.run(() =>
+              client.execute(operation, {
+                pattern: "safe",
+                mode: "regex",
+              }),
+            )
+          ).ok,
+        ).toBe(true);
+        expect(
+          (
+            await settings.run(() =>
+              client.execute(operation, {
+                pattern: "literal",
+                mode: "literal",
+              }),
+            )
+          ).ok,
+        ).toBe(true);
+        expect(seen).toEqual([23, 71, undefined]);
+      } finally {
+        await client.close();
+      }
+    },
+  );
+
+  it("does not claim retained annotations when worker cleanup is unconfirmed", async () => {
+    const client = await createElfClient(
+      remoteFailure(
+        "regex_worker_cleanup_failed",
+        "The regex worker could not be reaped",
+      ),
+    );
+    try {
+      const result = await client.execute("search_strings", {
+        pattern: "a",
+        mode: "regex",
+      });
+      if (result.ok) throw new Error("Expected the cleanup failure");
+      const projected = projectAnalysisError(result.error);
+      expect(projected.code).toBe("execution_failure");
+      expect(projected.message).not.toContain(GHIDRA_ANNOTATIONS_RETAINED);
+      expect(projected.remediation.action).toContain(
+        "before starting another worker",
+      );
+    } finally {
+      await client.close();
+    }
   });
 });

@@ -400,6 +400,7 @@ export class GhidraClient {
       readonly signal?: AbortSignal;
       readonly progress?: ProgressReporter;
       readonly decompileTimeoutSeconds?: number | null;
+      readonly regexMatchingDeadlineMs?: number;
     } = {},
   ): Promise<Result<JsonValue, GhidraSessionError>> {
     const started = await this.start(options.signal, options.progress);
@@ -423,6 +424,7 @@ export class GhidraClient {
     options: {
       readonly signal?: AbortSignal;
       readonly decompileTimeoutSeconds?: number | null;
+      readonly regexMatchingDeadlineMs?: number;
     },
   ): Promise<Result<JsonValue, GhidraSessionError>> {
     const pattern =
@@ -445,6 +447,9 @@ export class GhidraClient {
         ...(options.decompileTimeoutSeconds === undefined
           ? {}
           : { decompileTimeoutSeconds: options.decompileTimeoutSeconds }),
+        ...(options.regexMatchingDeadlineMs === undefined
+          ? {}
+          : { regexMatchingDeadlineMs: options.regexMatchingDeadlineMs }),
       },
     );
   }
