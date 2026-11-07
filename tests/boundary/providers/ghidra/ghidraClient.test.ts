@@ -2646,3 +2646,38 @@ it.each(["search_procedures", "search_strings"] as const)(
     ).toBe(4);
   },
 );
+
+it.each(["search_strings", "search_procedures"] as const)(
+  "%s carries the accepted regex budget through the queue to the real socket",
+  async (operation) => {
+    const launcher = new FixtureLauncher();
+    const client = clientFor(launcher);
+    const started = await client.start();
+    if (!started.ok) throw started.error;
+    const child = await launcher.started;
+    const observed = new Promise<unknown>((resolve) => {
+      const listener = (message: unknown) => {
+        if (
+          typeof message === "object" &&
+          message !== null &&
+          "method" in message &&
+          message.method === operation
+        ) {
+          child.off("message", listener);
+          resolve(message);
+        }
+      };
+      child.on("message", listener);
+    });
+    const result = await client.callTool(
+      operation,
+      { pattern: "fixture", mode: "regex" },
+      { regexMatchingDeadlineMs: 37 },
+    );
+    expect(result.ok).toBe(true);
+    expect(await observed).toMatchObject({
+      method: operation,
+      regex_matching_deadline_ms: 37,
+    });
+  },
+);
