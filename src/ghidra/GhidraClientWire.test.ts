@@ -140,6 +140,34 @@ describe("GhidraWire request ceiling", () => {
   );
 });
 
+it.each([1, 5000, 2147483647])(
+  "sends regex budget %s without a transport deadline",
+  async (budget) => {
+    const { wire, writes, pending } = harness(limit(8192));
+    const result = wire.request(
+      "search_strings",
+      { pattern: "(a+)+$", mode: "regex" },
+      { regexMatchingDeadlineMs: budget },
+    );
+    expect(JSON.parse(writes[0]!)).toMatchObject({
+      regex_matching_deadline_ms: budget,
+    });
+    expect(JSON.parse(writes[0]!)).not.toHaveProperty("timeoutMs");
+    pending.settle(1, ok([]));
+    expect(await result).toEqual(ok([]));
+  },
+);
+
+it("omits the regex budget when the caller did not supply it", async () => {
+  const { wire, writes, pending } = harness(limit(8192));
+  const result = wire.request("search_strings", { pattern: "literal" }, {});
+  expect(JSON.parse(writes[0]!)).not.toHaveProperty(
+    "regex_matching_deadline_ms",
+  );
+  pending.settle(1, ok([]));
+  expect(await result).toEqual(ok([]));
+});
+
 it.each([null, 7])(
   "sends the accepted decompile budget %s in the request envelope",
   async (budget) => {

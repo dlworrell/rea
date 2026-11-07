@@ -2,6 +2,7 @@ import {
   requireMcpToolError,
   mcpTextValue,
   requireMcpOperationResult,
+  requireMcpOutput,
 } from "./mcp-verifier-results.mjs";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -546,6 +547,74 @@ export async function verifyGhidraBoundaries(
     });
   assert.equal((await sourceProcedure(sourceBefore)).item.name, name);
   assert.equal((await sourceProcedure(sourceAfter)).item.name, changes.name);
+  const regexSetting = "regex.matching_deadline_ms";
+  const settingsReply = await client.callTool(
+    {
+      name: "inspect_analysis_settings",
+      arguments: { settings: [regexSetting] },
+    },
+    options,
+  );
+  const priorRegexSetting = requireMcpOutput(
+    settingsReply,
+    "inspect_analysis_settings",
+  ).settings.find((item) => item.setting === regexSetting);
+  assert.ok(priorRegexSetting);
+  const setRegexDeadline = async (change) => {
+    const reply = await client.callTool(
+      {
+        name: "update_analysis_settings",
+        arguments: { changes: [{ setting: regexSetting, ...change }] },
+      },
+      options,
+    );
+    requireMcpOutput(reply, "update_analysis_settings");
+    successfulCalls++;
+  };
+  const ownershipBeforeRegexTimeout = await readFile(
+    join(runtimeRoot, "ownership.json"),
+    "utf8",
+  );
+  await setRegexDeadline({ action: "set", value: 1 });
+  try {
+    // The minimal accepted budget deterministically exercises the deadline
+    // and cleanup boundary; the pure-JDK lane separately holds active matching.
+    const reply = await client.callTool(
+      {
+        name: "search_strings",
+        arguments: { pattern: "^(a+)+$", mode: "regex" },
+      },
+      options,
+    );
+    const error = requireMcpToolError(reply);
+    assert.equal(error.code, "provider_timeout");
+    assert.equal(error.details.limit.setting, regexSetting);
+    assert.equal(error.details.limit.effective_value, 1);
+    assert.ok(error.message.includes(GHIDRA_ANNOTATIONS_RETAINED));
+    rejectedCalls++;
+  } finally {
+    await setRegexDeadline(
+      priorRegexSetting.source === "runtime"
+        ? { action: "set", value: priorRegexSetting.value }
+        : { action: "reset" },
+    );
+  }
+  assert.equal(
+    await readFile(join(runtimeRoot, "ownership.json"), "utf8"),
+    ownershipBeforeRegexTimeout,
+    "Regex timeout must preserve the exact Ghidra runtime ownership identity",
+  );
+  assert.deepEqual(
+    await call("analyze_function", { procedure: address, detail: "complete" }),
+    updated.dossier,
+    "Regex timeout must preserve the annotated Program",
+  );
+  assert.ok(
+    (
+      await call("search_procedures", { pattern: "^dead$", mode: "regex" })
+    ).some((item) => item.address === address),
+    "A subsequent isolated regex must succeed in the same annotated Program",
+  );
   const regexPattern = "^(a|aa)*b$";
   const regexFailure = await client.callTool(
     {

@@ -3,11 +3,15 @@ import {
   GHIDRA_LITERAL_CANDIDATES_LIMITATION,
 } from "./GhidraLiteralSearch.js";
 import { ghidraCheckpointSelectionSchema } from "./GhidraCheckpoint.js";
+import {
+  DEFAULT_REGEX_MATCHING_DEADLINE_MS,
+  MAX_GHIDRA_DECOMPILE_TIMEOUT_SECONDS,
+  MAXIMUM_REGEX_MATCHING_DEADLINE_MS,
+} from "../domain/analysisResourceLimits.js";
 import { ghidraProjectHistoryEvidence } from "./GhidraProjectHistory.js";
 import type { Evidence, EvidenceLocation } from "../domain/evidence.js";
 import { ghidraProjectCommitmentSchema } from "./GhidraProjectSnapshot.js";
 import { analysisSettingLimit } from "../domain/analysisSettingDefinitions.js";
-import { MAX_GHIDRA_DECOMPILE_TIMEOUT_SECONDS } from "../domain/analysisResourceLimits.js";
 import { z } from "zod";
 import { analysisClientFailureForOperation } from "../providers/AnalysisClientFailure.js";
 import { analysisErrorWithCleanupFailure } from "../domain/analysisErrorCleanup.js";
@@ -977,12 +981,18 @@ export const createGhidraProviderClient = (input: {
         ? parseGhidraFunctionInput(operation, parameters)
         : parseGhidraInventoryInput(operation, parameters);
       if (!input.ok) return input;
+      const regexMatchingDeadline = { ...config.regexMatchingDeadline };
       // A report binds before any query runs. The client shares one startup
       // attempt, so `callTool` reuses this launch; a restart is checked again.
       const started = await startSession(operation, options);
       if (!started.ok) return started;
       const called = await client.callTool(operation, input.value, {
         decompileTimeoutSeconds: config.ghidraDecompileTimeoutSeconds ?? null,
+        ...((operation === "search_strings" ||
+          operation === "search_procedures") &&
+        input.value.mode === "regex"
+          ? { regexMatchingDeadlineMs: regexMatchingDeadline.deadlineMs }
+          : {}),
         ...(options?.signal === undefined ? {} : { signal: options.signal }),
         ...(options?.progress === undefined
           ? {}
@@ -996,7 +1006,10 @@ export const createGhidraProviderClient = (input: {
           projectSessionError(
             operation,
             called.error,
-            projection,
+            {
+              ...projection,
+              limits: { ...projection.limits, regexMatchingDeadline },
+            },
             lostProviderHealth(),
             input.value,
           ),
@@ -1207,6 +1220,7 @@ type GhidraProjectionLimits = Pick<
   AppConfig,
   | "ghidraStartupTimeoutMs"
   | "ghidraDecompileTimeoutSeconds"
+  | "regexMatchingDeadline"
   | "ghidraExistingProject"
 >;
 
@@ -1469,6 +1483,62 @@ const projectPrimarySessionError = (
       },
     );
   }
+  if (failure.kind === "remote" && failure.remoteCode === "regex_timeout") {
+    const deadline = limits.regexMatchingDeadline;
+    const outcome = ghidraRequestOutcome(
+      failure,
+      "Only this search's isolated regex worker was stopped.",
+      GHIDRA_ANNOTATIONS_RETAINED,
+      source,
+    );
+    const budget = `The effective regex.matching_deadline_ms is ${String(deadline.deadlineMs)} ms (source ${deadline.source}; default ${String(DEFAULT_REGEX_MATCHING_DEADLINE_MS)} ms, floor 1 ms, maximum ${String(MAXIMUM_REGEX_MATCHING_DEADLINE_MS)} ms).`;
+    return new AnalysisTimeoutError(operation, deadline.deadlineMs, {
+      ...context,
+      diagnostics: {
+        ...context.diagnostics,
+        regex_matching_deadline_ms: deadline.deadlineMs,
+        regex_matching_deadline_source: deadline.source,
+      },
+      limit: analysisSettingLimit(
+        "regex.matching_deadline_ms",
+        deadline.deadlineMs,
+        deadline.source,
+      ),
+      userMessage: outcome.userMessage,
+      remediationAction: `${budget} Simplify the regex or select mode literal. To allow more time, raise REA_REGEX_MATCHING_DEADLINE_MS in the environment of a new REA invocation, then rerun the command. This does not raise the client's deadline.`,
+      continuingCallerGuidance: {
+        ...outcome.continuingCallerGuidance,
+        remediationAction: `${budget} Simplify the regex or select mode literal, or use update_analysis_settings with setting regex.matching_deadline_ms and action set to raise the deadline for the next accepted search without restarting REA. This does not raise the client's deadline or clear retained cleanup.${failure.concurrentCancellation === undefined ? "" : " Follow the reported Ghidra session shutdown and cleanup outcome before retrying."}`,
+      },
+    });
+  }
+  if (failure.kind === "remote" && failure.remoteCode === "regex_worker_failed")
+    return new ProviderAdapterError("ghidra", operation, {
+      ...context,
+      ...ghidraRequestOutcome(
+        failure,
+        "Only this search's isolated regex worker failed.",
+        GHIDRA_ANNOTATIONS_RETAINED,
+        source,
+      ),
+      remediationAction:
+        "Review the retained regex worker diagnostic before retrying, or select mode literal. A worker failure does not establish deadline or memory exhaustion.",
+    });
+  if (
+    failure.kind === "remote" &&
+    failure.remoteCode === "regex_worker_cleanup_failed"
+  )
+    return new ProviderAdapterError("ghidra", operation, {
+      ...context,
+      userMessage: ghidraRequestOutcome(
+        failure,
+        "Isolated regex worker cleanup is unconfirmed.",
+        "",
+        source,
+      ).userMessage,
+      remediationAction:
+        "The bridge retains the worker cleanup owner. A subsequent regex search retries that cleanup before starting another worker; do not assume the worker has exited or that raising the deadline clears this blocker.",
+    });
   if (failure.kind === "analysis_timeout")
     return new AnalysisTimeoutError(
       operation,
@@ -1477,7 +1547,8 @@ const projectPrimarySessionError = (
     );
   if (
     failure.kind === "remote" &&
-    failure.remoteCode === "regex_stack_exhausted"
+    (failure.remoteCode === "regex_stack_exhausted" ||
+      failure.remoteCode === "regex_worker_memory_exhausted")
   ) {
     const outcome = ghidraRequestOutcome(
       failure,

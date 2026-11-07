@@ -6,6 +6,13 @@ import {
 } from "../config/runtimeAnalysisSettings.js";
 import { parseConfig } from "../config/parseConfig.js";
 
+it("advertises Ghidra's regex deadline without advertising the V8 heap request", () => {
+  const inspected = new AnalysisSettings({}).inspect({ provider: "ghidra" });
+  const settings = inspected.settings.map((entry) => entry.setting);
+  expect(settings).toContain("regex.matching_deadline_ms");
+  expect(settings).not.toContain("regex.worker_heap_request_mib");
+});
+
 it("updates atomically, restores launch values, and refuses stale or invalid writes", () => {
   const store = new AnalysisSettings({ REA_ASAR_MAX_HEADER_BYTES: "20000000" });
   const inspect = () => store.inspect({ settings: ["asar.max_header_bytes"] });
@@ -110,7 +117,7 @@ it("exposes shared provider controls and preserves the explicit unbounded decomp
     store
       .inspect({ provider: "ghidra", operation: "search_strings" })
       .settings.map(({ setting }) => setting),
-  ).toEqual(["ghidra.startup_timeout_ms"]);
+  ).toEqual(["ghidra.startup_timeout_ms", "regex.matching_deadline_ms"]);
   expect(
     store
       .inspect({ provider: "ida", operation: "search_strings" })
