@@ -641,21 +641,34 @@ interface OpenedJournal {
   readonly journalBytes: number;
 }
 
-/** Read the journal only when it is a regular file, not a symlink. */
+/**
+ * Read the journal only when it is a regular file, not a symlink. The file is
+ * opened first and checked on its descriptor, so no name check precedes the
+ * use (CodeQL js/file-system-race): O_NOFOLLOW refuses a symlink and
+ * O_NONBLOCK keeps a FIFO from stalling the open. Where O_NOFOLLOW does not
+ * exist (Windows), the name is checked for a symlink after the open.
+ */
 const readJournalBytes = async (
   root: string,
   resources: ExportResources,
 ): Promise<unknown> => {
   const path = join(root, DECOMPILE_DIRECTORY_JOURNAL_NAME);
-  const stat = await lstat(path).catch((cause: unknown) => cause);
-  if (!isStat(stat)) return stat;
-  if (!stat.isFile()) return new Error("journal is not a regular file");
-  const handle = await open(path, constants.O_RDONLY | NO_FOLLOW).catch(
-    (cause: unknown) => cause,
-  );
+  const handle = await open(
+    path,
+    constants.O_RDONLY | NO_FOLLOW | (constants.O_NONBLOCK ?? 0),
+  ).catch((cause: unknown) => cause);
   if (!isFileHandle(handle)) return handle;
   const close = resources.ownFile(handle, path);
-  const bytes = await handle.readFile().catch((cause: unknown) => cause);
+  const opened = await handle.stat().catch((cause: unknown) => cause);
+  const named =
+    NO_FOLLOW === 0
+      ? await lstat(path).catch((cause: unknown) => cause)
+      : undefined;
+  const bytes = !isStat(opened)
+    ? opened
+    : !opened.isFile() || (isStat(named) && named.isSymbolicLink())
+      ? new Error("journal is not a regular file")
+      : await handle.readFile().catch((cause: unknown) => cause);
   return (await close())
     ? bytes
     : new Error("decompile journal read handle could not be closed");
