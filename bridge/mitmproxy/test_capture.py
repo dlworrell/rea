@@ -261,5 +261,173 @@ class TransportUserinfoTests(unittest.TestCase):
         self.assertEqual(capture.without_userinfo(b"//a\\b@host"), b"//a\\b@host")
 
 
+class OfflineCaptureShutdownTests(unittest.TestCase):
+    """Request admission failures still shut mitmdump down."""
+
+    def run_addon(self, request_path):
+        master = mock.Mock()
+        capture.ctx.options = types.SimpleNamespace(rea_request_path=request_path)
+        capture.ctx.master = master
+        with mock.patch.object(capture.resource, "setrlimit"), \
+                mock.patch.object(capture, "decode", return_value={"records": []}), \
+                mock.patch("sys.stderr"):
+            capture.OfflineCapture().running()
+        return master
+
+    def test_unreadable_requests_still_shut_down(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            malformed = os.path.join(folder, "malformed.json")
+            with open(malformed, "w", encoding="utf-8") as handle:
+                handle.write("{not json")
+            no_reply_path = os.path.join(folder, "no-reply-path.json")
+            with open(no_reply_path, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            for path in ("", os.path.join(folder, "missing.json"), malformed, no_reply_path):
+                with self.subTest(path=os.path.basename(path) or "empty option"):
+                    self.run_addon(path).shutdown.assert_called_once_with()
+            self.assertEqual(sorted(os.listdir(folder)), ["malformed.json", "no-reply-path.json"])
+
+    def test_readable_request_writes_the_reply_and_shuts_down(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            reply = os.path.join(folder, "reply.json")
+            request = os.path.join(folder, "request.json")
+            with open(request, "w", encoding="utf-8") as handle:
+                json.dump({"reply_path": reply}, handle)
+            self.run_addon(request).shutdown.assert_called_once_with()
+            with open(reply, encoding="ascii") as handle:
+                self.assertEqual(json.load(handle), {"ok": True, "value": {"records": []}})
+
+
+def nested(depth, leaf="x"):
+    value = leaf
+    for _ in range(depth):
+        value = {"k": value}
+    return value
+
+
+class SensitiveValueTests(unittest.TestCase):
+    """Explicit sensitive values are redacted wherever they appear."""
+
+    def test_string_value_is_redacted(self):
+        record = capture.project_record({"note": "token=s3cr3t-value"}, ["s3cr3t"])
+        self.assertIsNone(record["reported"]["note"])
+        self.assertIn({"pointer": "/note", "reason": "explicit-sensitive-value"}, record["redactions"])
+
+    def test_bytes_value_is_redacted_with_no_content_or_digest(self):
+        record = capture.project_record({"body": b"user s3cr3t here"}, ["s3cr3t"])
+        self.assertIsNone(record["reported"]["body"])
+        field = next(f for f in record["binary_fields"] if f["pointer"] == "/body")
+        self.assertEqual((field["state"], field["content_base64"], field["bytes"], field["sha256"]),
+                         ("redacted", None, None, None))
+
+    def test_numeric_literal_is_redacted_and_not_listed(self):
+        record = capture.project_record({"pin": 424242, "port": 443}, ["4242"])
+        self.assertIsNone(record["reported"]["pin"])
+        self.assertEqual(record["reported"]["port"], 443)
+        self.assertEqual([n["pointer"] for n in record["numeric_literals"]], ["/port"])
+        self.assertIn({"pointer": "/pin", "reason": "explicit-sensitive-value"}, record["redactions"])
+
+    def test_property_name_scope_omits_the_key_and_its_coordinates(self):
+        record = capture.project_record({"s3cr3t-field": {"inner": b"bytes", "n": 7}, "kept": 1}, ["s3cr3t"])
+        self.assertEqual(record["reported"], {"kept": 1})
+        self.assertIn({"pointer": "", "reason": "explicit-sensitive-value", "scope": "property-name"},
+                      record["redactions"])
+        # validate_omitted discards the omitted subtree's binary fields and numbers.
+        self.assertFalse(any(f["pointer"].startswith("/s3cr3t-field") for f in record["binary_fields"]))
+        self.assertEqual([n["pointer"] for n in record["numeric_literals"]], ["/kept"])
+
+    def test_omitted_subtree_is_still_validated(self):
+        with self.assertRaises(capture.CaptureFailure) as caught:
+            capture.project_record({"s3cr3t-field": nested(70)}, ["s3cr3t"])
+        self.assertEqual(caught.exception.reason, "input-limit")
+
+
+class CredentialHeaderTests(unittest.TestCase):
+    def test_cookie_and_authorization_values_are_redacted(self):
+        state = {"request": {"headers": [[b"Authorization", b"Bearer abc"], [b"Cookie", b"id=1"],
+                                         [b"Accept", b"text/html"]]}}
+        record = capture.project_record(state, [])
+        headers = record["reported"]["request"]["headers"]
+        self.assertEqual([h[1] for h in headers], [None, None, "text/html"])
+        for index in (0, 1):
+            pointer = f"/request/headers/{index}/1"
+            self.assertIn({"pointer": pointer, "reason": "transport-credential"}, record["redactions"])
+            field = next(f for f in record["binary_fields"] if f["pointer"] == pointer)
+            self.assertEqual((field["state"], field["content_base64"]), ("redacted", None))
+
+
+class InputLimitTests(unittest.TestCase):
+    def test_nesting_beyond_64_levels_is_refused(self):
+        capture.project_record(nested(63), [])  # depth 63 is still inside the budget
+        with self.assertRaises(capture.CaptureFailure) as caught:
+            capture.project_record(nested(66), [])
+        self.assertEqual(caught.exception.reason, "input-limit")
+
+    def test_bounded_reader_refuses_lengths_beyond_the_capture(self):
+        import io
+        reader = capture.BoundedReader(io.BytesIO(b"0123456789"), 10)
+        self.assertEqual(reader.read(4), b"0123")
+        self.assertEqual(reader.read(6), b"456789")
+        for count in (1, -1):
+            with self.subTest(count=count), self.assertRaises(capture.CaptureFailure) as caught:
+                reader.read(count)
+            self.assertEqual(caught.exception.reason, "format")
+
+
+class DecodeTests(unittest.TestCase):
+    def decode_with(self, load, data=b"x" * 16, version="12.2.3"):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            snapshot = os.path.join(folder, "flows")
+            with open(snapshot, "wb") as handle:
+                handle.write(data)
+            with mock.patch.object(capture.tnetstring, "load", load, create=True), \
+                    mock.patch.object(capture.version, "VERSION", version):
+                return capture.decode({"snapshot_path": snapshot, "sensitive_values": []})
+
+    def test_version_mismatch_is_unsupported(self):
+        with self.assertRaises(capture.CaptureFailure) as caught:
+            self.decode_with(lambda reader: {}, version="11.0.0")
+        self.assertEqual(caught.exception.reason, "unsupported")
+
+    def test_malformed_record_maps_to_format_with_its_offset(self):
+        def load(reader):
+            raise ValueError("bad length")
+        with self.assertRaises(capture.CaptureFailure) as caught:
+            self.decode_with(load)
+        self.assertEqual(caught.exception.reason, "format")
+        self.assertIn("byte offset 0", str(caught.exception))
+
+    def test_oversized_declared_read_is_refused(self):
+        with self.assertRaises(capture.CaptureFailure) as caught:
+            self.decode_with(lambda reader: reader.read(1 << 30))
+        self.assertEqual(caught.exception.reason, "format")
+        self.assertIn("beyond the retained capture", str(caught.exception))
+
+    def test_non_dictionary_record_is_refused(self):
+        with self.assertRaises(capture.CaptureFailure) as caught:
+            self.decode_with(lambda reader: (reader.read(16), [])[1])
+        self.assertEqual(caught.exception.reason, "format")
+
+    def test_records_are_projected_in_order(self):
+        result = self.decode_with(lambda reader: (reader.read(8), {"n": 1})[1])
+        self.assertEqual(result["total_records"], 2)
+        self.assertEqual([r["location"] for r in result["records"]],
+                         [{"kind": "byte-range", "offset": 0, "bytes": 8},
+                          {"kind": "byte-range", "offset": 8, "bytes": 8}])
+
+
+class FailureReplyTests(unittest.TestCase):
+    def test_reasons_stay_distinct(self):
+        self.assertEqual(capture.failure_reply(capture.CaptureFailure("format", "m", "/p"))["reason"], "format")
+        self.assertEqual(capture.failure_reply(MemoryError())["reason"], "resource-limit")
+        reply = capture.failure_reply(KeyError("x"))
+        self.assertEqual((reply["reason"], reply["message"]),
+                         ("decoder", "Offline native decoder failed unexpectedly: KeyError."))
+
+
 if __name__ == "__main__":
     unittest.main()

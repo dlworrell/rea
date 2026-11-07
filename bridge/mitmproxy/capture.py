@@ -11,6 +11,7 @@ import json
 import math
 import re
 import resource
+import sys
 from pathlib import Path
 from urllib.parse import unquote_to_bytes
 
@@ -364,19 +365,29 @@ class OfflineCapture:
         resource.setrlimit(resource.RLIMIT_CPU, (30, 30))
         resource.setrlimit(resource.RLIMIT_FSIZE, (OUTPUT_BYTES, OUTPUT_BYTES))
         resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        request = json.loads(Path(ctx.options.rea_request_path).read_text(encoding="utf-8"))
         try:
-            response = {"ok": True, "value": decode(request)}
-        except Exception as error:
-            response = failure_reply(error)
-        try:
+            # Read the request inside the guarded region so that an empty option, a
+            # missing file or malformed JSON still reaches shutdown below. With no
+            # readable request there is no reply path to write, so mitmdump exits at
+            # once and REA's runner finds no reply, instead of an idle mitmdump
+            # lasting until the capture timeout (RLIMIT_CPU does not bound idle time).
+            try:
+                request = json.loads(Path(ctx.options.rea_request_path).read_text(encoding="utf-8"))
+                reply_path = Path(request["reply_path"])
+            except Exception as error:
+                print("REA offline capture: unreadable request (" + type(error).__name__ + ").", file=sys.stderr)
+                return
+            try:
+                response = {"ok": True, "value": decode(request)}
+            except Exception as error:
+                response = failure_reply(error)
             try:
                 output = json.dumps(response, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
             except Exception as error:
                 output = json.dumps(failure_reply(error), separators=(",", ":")).encode("ascii")
             if len(output) > OUTPUT_BYTES:
                 output = b'{"ok":false,"reason":"limit","message":"Native reply exceeds the complete-evidence output budget.","pointer":""}'
-            Path(request["reply_path"]).write_bytes(output)
+            reply_path.write_bytes(output)
         finally:
             ctx.master.shutdown()
 
