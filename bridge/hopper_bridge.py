@@ -1,8 +1,21 @@
 """Authenticated REA adapter executed on Hopper's dedicated Python thread.
 
-The bootstrap injects ``REA_SOCKET`` and a random ``REA_TOKEN`` before executing
-this file with Hopper's supported ``--python`` launcher option. Keep all Hopper
-API access on this thread: moving dispatch to a worker can deadlock Hopper.
+The bootstrap (``src/hopper/BridgeLauncher.ts``) defines these globals before
+executing this file with Hopper's supported ``--python`` launcher option:
+
+- ``REA_SOCKET`` (str): path of the Unix socket this adapter listens on.
+- ``REA_TOKEN`` (str): random per-session token every request must carry.
+- ``REA_RUN_ID`` (str): run identifier echoed in the ``health`` reply.
+- ``REA_TARGET_PATH`` (str): path of the document REA loaded into Hopper.
+- ``REA_OWNS_PROCESS_LIFETIME`` (bool): whether ``shutdown`` may quit Hopper.
+- ``REA_RECONNECT_TIMEOUT_SECONDS`` (float): socket wait between connections.
+- ``REA_BRIDGE_MAX_REQUEST_BYTES`` (int, optional): request payload budget;
+  when absent, the environment variable of that name or the 16 MiB default
+  applies.
+
+A bootstrap that omits a required name fails with ``NameError``. Keep all
+Hopper API access on this thread: moving dispatch to a worker can deadlock
+Hopper.
 """
 
 import json
