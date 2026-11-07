@@ -107,8 +107,10 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
         initialize.invoke(bridge);
 
         // Exercise the real production error factory, without claiming a natural regex overflow.
-        Method regexFactory = bridge.getClass().getDeclaredMethod(
-            "regexStackExhausted", String.class, String.class);
+        Class<?> regexSearch = Class.forName("ReaGhidraRegexSearch", true,
+            bridge.getClass().getClassLoader());
+        Method regexFactory = regexSearch.getDeclaredMethod(
+            "stackExhausted", String.class, String.class);
         regexFactory.setAccessible(true);
         Throwable regexFailure = (Throwable) regexFactory.invoke(null, "(a+)+$", "matching");
         require("regex_failure_preserves_stage_and_pattern",
@@ -119,8 +121,16 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
                 !regexFailure.getMessage().contains("Use literal"));
         Class<?> requestType = Class.forName(bridge.getClass().getName() + "$Request", true, bridge.getClass().getClassLoader());
         Class<?> descriptorType = Class.forName(bridge.getClass().getName() + "$SessionDescriptor", true, bridge.getClass().getClassLoader());
-        Constructor<?> requestConstructor = requestType.getDeclaredConstructor(int.class, String.class, JsonObject.class);
+        Constructor<?> requestConstructor = requestType.getDeclaredConstructor(
+            int.class, String.class, JsonObject.class, Integer.class, Integer.class);
         requestConstructor.setAccessible(true);
+        Constructor<?> descriptorConstructor = descriptorType.getDeclaredConstructor(
+            String.class, String.class, String.class, String.class, String.class,
+            String.class, String.class, JsonArray.class, int.class, boolean.class);
+        descriptorConstructor.setAccessible(true);
+        Object descriptor = descriptorConstructor.newInstance("unix-socket", "", "fixture",
+            "fixture", currentProgram.getExecutableSHA256(), Application.getApplicationVersion(),
+            "0".repeat(64), new JsonArray(), 0, false);
         Method analyze = bridge.getClass().getDeclaredMethod("handleRequest", requestType, descriptorType);
         analyze.setAccessible(true);
         Method pseudocode = bridge.getClass().getDeclaredMethod("procedurePseudocode", JsonObject.class);
@@ -134,7 +144,7 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
         JsonObject query = new JsonObject();
         query.addProperty("procedure", procedure);
         // Exercise the actual wire response producer, including cache metadata.
-        Object request = requestConstructor.newInstance(1, "analyze_function", query);
+        Object request = requestConstructor.newInstance(1, "analyze_function", query, null, null);
         JsonObject pseudocodeQuery = new JsonObject();
         pseudocodeQuery.add("document", JsonNull.INSTANCE);
         pseudocodeQuery.addProperty("procedure", procedure);
@@ -142,7 +152,7 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
         JsonObject baseline;
         JsonObject degraded;
         try {
-            baseline = (JsonObject) analyze.invoke(bridge, request, null);
+            baseline = (JsonObject) analyze.invoke(bridge, request, descriptor);
             JsonObject value = baseline.getAsJsonObject("value");
             require("healthy_snapshot_policy_preserved", !baseline.has("cache_policy"));
             require("baseline_pseudocode_available", !value.get("pseudocode").getAsString().isEmpty() &&
@@ -154,7 +164,7 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
             require("baseline_multiple_blocks_present", value.getAsJsonArray("basic_blocks").size() > 1);
 
             decompiler.set(bridge, failing(target, DisposeState.NOT_DISPOSED));
-            degraded = (JsonObject) analyze.invoke(bridge, request, null);
+            degraded = (JsonObject) analyze.invoke(bridge, request, descriptor);
             JsonObject dossier = degraded.getAsJsonObject("value");
             require("decompiler_failure_is_live", degraded.get("cache_policy").getAsString().equals("live"));
             String expected = "Ghidra decompilation failed: " + INJECTED;
@@ -194,7 +204,7 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
 
             decompiler.set(bridge, failing(target, DisposeState.DISPOSED_ON_CANCEL));
             try {
-                analyze.invoke(bridge, request, null);
+                analyze.invoke(bridge, request, descriptor);
                 throw new IllegalStateException("Cancelled decompilation unexpectedly returned a dossier");
             } catch (InvocationTargetException failure) {
                 require("cancellation_still_ends_request",
@@ -208,7 +218,7 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
             limit.setInt(bridge, 5);
             String limitText = "exceeded the 5-second limit set by REA_GHIDRA_DECOMPILE_TIMEOUT_SECONDS";
             decompiler.set(bridge, failing(target, DisposeState.DISPOSED_ON_TIMEOUT));
-            JsonObject timedOut = (JsonObject) analyze.invoke(bridge, request, null);
+            JsonObject timedOut = (JsonObject) analyze.invoke(bridge, request, descriptor);
             JsonObject timedOutDossier = timedOut.getAsJsonObject("value");
             require("timed_out_decompile_is_live",
                 timedOut.has("cache_policy") && timedOut.get("cache_policy").getAsString().equals("live"));
@@ -233,7 +243,7 @@ public class ReaDecompilerFailureProbe extends GhidraScript {
             limit.setInt(bridge, 0);
 
             decompiler.set(bridge, real);
-            JsonObject recovered = (JsonObject) analyze.invoke(bridge, request, null);
+            JsonObject recovered = (JsonObject) analyze.invoke(bridge, request, descriptor);
             require("session_recovers_after_failure", recovered.getAsJsonObject("value")
                 .getAsJsonObject("facet_availability").getAsJsonObject("pseudocode").get("available").getAsBoolean());
         } finally {
