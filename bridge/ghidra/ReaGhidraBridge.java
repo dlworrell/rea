@@ -42,7 +42,6 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
@@ -183,6 +182,12 @@ public final class ReaGhidraBridge extends HeadlessScript {
     private String identityAdmissionFailure;
     /** Per-function native decompiler limit from the session; 0 leaves it unbounded. */
     private int decompileTimeoutSeconds;
+    // Compatibility fallback; current hosts send the accepted operation's
+    // DEFAULT_REGEX_MATCHING_DEADLINE_MS/runtime setting from the domain owner.
+    private static final int DEFAULT_REGEX_MATCHING_DEADLINE_MILLIS = 5_000;
+    private int regexMatchingDeadlineMillis = DEFAULT_REGEX_MATCHING_DEADLINE_MILLIS;
+    private Path regexPrivateParent;
+    private final List<ReaGhidraRegexSearch> regexSearchOwners = new ArrayList<>();
     // DecompileProcess converts seconds to an int millisecond timer delay.
     private static final int MAX_DECOMPILE_TIMEOUT_SECONDS = Integer.MAX_VALUE / 1000;
     private final ReaGhidraExtensions analysisExtensions = new ReaGhidraExtensions();
@@ -198,6 +203,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
         }
         Path descriptorPath = Path.of(arguments[0]);
         checkpointDirectory = descriptorPath.toAbsolutePath().normalize().getParent();
+        regexPrivateParent = checkpointDirectory;
         SessionDescriptor descriptor = readDescriptor(descriptorPath);
         decompileTimeoutSeconds = descriptor.decompileTimeoutSeconds();
         // Windows retains a native immutable bearer descriptor lease until
@@ -254,11 +260,15 @@ public final class ReaGhidraBridge extends HeadlessScript {
             serve(descriptor);
         }
         finally {
-            if (decompiler != null) {
-                decompiler.dispose();
-                decompiler = null;
+            try {
+                closeRegexSearches();
+            } finally {
+                if (decompiler != null) {
+                    decompiler.dispose();
+                    decompiler = null;
+                }
+                analysisExtensions.close();
             }
-            analysisExtensions.close();
         }
     }
 
@@ -424,6 +434,8 @@ public final class ReaGhidraBridge extends HeadlessScript {
                 }
                 decompileTimeoutSeconds = request.decompileTimeoutSeconds() == null
                     ? descriptor.decompileTimeoutSeconds() : request.decompileTimeoutSeconds();
+                regexMatchingDeadlineMillis = request.regexMatchingDeadlineMillis() == null
+                    ? DEFAULT_REGEX_MATCHING_DEADLINE_MILLIS : request.regexMatchingDeadlineMillis();
                 writeSuccess(writer, request.id, handleRequest(request, descriptor));
             }
             catch (RequestFailure failure) {
@@ -2354,18 +2366,25 @@ public final class ReaGhidraBridge extends HeadlessScript {
             throw new RequestFailure("invalid_request", "mode must be literal or regex");
         }
         boolean caseSensitive = requireBoolean(params, "case_sensitive");
+        if (mode.equals("regex")) {
+            if (params.has("literal_ascii_candidate"))
+                throw new RequestFailure("invalid_request", "ASCII candidate applies only to insensitive literals");
+            return searchRegex(expression, caseSensitive, procedureSearch);
+        }
         ValueMatcher matcher;
-        if (mode.equals("literal") && !caseSensitive) {
+        if (!caseSensitive) {
             if (!params.has("literal_ascii_candidate"))
                 throw new RequestFailure("invalid_request", "Insensitive literal search requires an ASCII candidate");
             matcher = literalCandidateMatcher(optionalString(params, "literal_ascii_candidate"));
         } else {
             if (params.has("literal_ascii_candidate"))
                 throw new RequestFailure("invalid_request", "ASCII candidate applies only to insensitive literals");
-            matcher = mode.equals("literal")
-                ? literalMatcher(expression)
-                : regexMatcher(expression, caseSensitive);
+            matcher = literalMatcher(expression);
         }
+        return searchMatches(matcher, procedureSearch);
+    }
+
+    private JsonArray searchMatches(ValueMatcher matcher, boolean procedureSearch) throws Exception {
         JsonArray items = new JsonArray();
         if (procedureSearch) {
             // Search the names exact lookup accepts, keeping one row per
@@ -4982,39 +5001,55 @@ public final class ReaGhidraBridge extends HeadlessScript {
         };
     }
 
-    private static ValueMatcher regexMatcher(String expression, boolean caseSensitive) {
-        Pattern pattern;
+    private JsonArray searchRegex(String expression, boolean caseSensitive,
+            boolean procedureSearch) throws Exception {
+        // Retry retained child cleanup before admitting another regex worker.
+        closeRegexSearches();
+        // Cold Ghidra inventory preparation is not regex evaluation. Complete
+        // it before starting the worker's single compile-and-match deadline.
+        if (procedureSearch) procedures();
+        else strings();
+        ReaGhidraRegexSearch search = new ReaGhidraRegexSearch(
+            regexPrivateParent, regexMatchingDeadlineMillis);
+        regexSearchOwners.add(search);
+        JsonArray result = null;
+        Exception failure = null;
         try {
-            pattern = Pattern.compile(
-                expression,
-                caseSensitive ? 0 : Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE
-            );
-        }
-        catch (PatternSyntaxException exception) {
-            // Java wraps compiler stack exhaustion in PatternSyntaxException
-            // without retaining its cause. This producer reason is not bad syntax.
-            if (exception.getDescription().equals("Stack overflow during pattern compilation"))
-                throw regexStackExhausted(expression, "compiling");
-            throw new RequestFailure("invalid_regex_pattern", "Invalid regex pattern " + expression + ": " + exception.getDescription() + " at index " + exception.getIndex());
-        }
-        catch (StackOverflowError exhausted) {
-            throw regexStackExhausted(expression, "compiling");
-        }
-        return value -> {
+            search.start(expression, caseSensitive);
+            result = searchMatches(search::matches, procedureSearch);
+            search.finish();
+        } catch (ReaGhidraRegexSearch.Failure exception) {
+            failure = new RequestFailure(exception.code(), exception.getMessage());
+        } catch (Exception exception) {
+            failure = exception;
+        } finally {
             try {
-                return pattern.matcher(value).find();
+                search.close();
+            } catch (ReaGhidraRegexSearch.Failure cleanup) {
+                String prior = failure == null ? "" : safeMessage(failure) + ". ";
+                failure = new RequestFailure("regex_worker_cleanup_failed",
+                    prior + cleanup.getMessage());
+            } finally {
+                if (search.isClosed()) regexSearchOwners.remove(search);
             }
-            catch (StackOverflowError exhausted) {
-                throw regexStackExhausted(expression, "matching");
-            }
-        };
+        }
+        if (failure != null) throw failure;
+        return result;
     }
 
-    // The host queue owns session lifetime, including concurrent cancellation.
-    private static RequestFailure regexStackExhausted(String expression, String stage) {
-        return new RequestFailure("regex_stack_exhausted",
-            "Ghidra's Java regex engine exhausted its stack while " + stage +
-            " pattern " + expression + ".");
+    private void closeRegexSearches() {
+        ReaGhidraRegexSearch.Failure failure = null;
+        for (ReaGhidraRegexSearch search : List.copyOf(regexSearchOwners)) {
+            try {
+                search.close();
+            } catch (ReaGhidraRegexSearch.Failure exception) {
+                failure = exception;
+            } finally {
+                if (search.isClosed()) regexSearchOwners.remove(search);
+            }
+        }
+        if (failure != null)
+            throw new RequestFailure("regex_worker_cleanup_failed", failure.getMessage());
     }
 
     private static SessionDescriptor readDescriptor(Path path) throws IOException {
@@ -5055,6 +5090,8 @@ public final class ReaGhidraBridge extends HeadlessScript {
         Set<String> keys = new HashSet<>(REQUEST_KEYS);
         if (parsed.isJsonObject() && parsed.getAsJsonObject().has("decompile_timeout_seconds"))
             keys.add("decompile_timeout_seconds");
+        if (parsed.isJsonObject() && parsed.getAsJsonObject().has("regex_matching_deadline_ms"))
+            keys.add("regex_matching_deadline_ms");
         JsonObject object = requireObject(parsed, keys);
         Integer timeout = null;
         if (object.has("decompile_timeout_seconds")) {
@@ -5062,6 +5099,12 @@ public final class ReaGhidraBridge extends HeadlessScript {
             timeout = value.isJsonNull() ? 0 : requireInteger(object, "decompile_timeout_seconds");
             if (!value.isJsonNull() && (timeout < 1 || timeout > MAX_DECOMPILE_TIMEOUT_SECONDS))
                 throw new IllegalArgumentException("Invalid per-request decompile deadline");
+        }
+        Integer regexDeadline = null;
+        if (object.has("regex_matching_deadline_ms")) {
+            regexDeadline = requireInteger(object, "regex_matching_deadline_ms");
+            if (regexDeadline < 1)
+                throw new IllegalArgumentException("Invalid regex matching deadline");
         }
         int id = requireInteger(object, "id");
         if (id <= 0 || !constantTimeEquals(requireString(object, "token"), expectedToken)) {
@@ -5071,7 +5114,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
         if (params == null || !params.isJsonObject()) {
             throw new IllegalArgumentException("Bridge request parameters are invalid");
         }
-        return new Request(id, requireString(object, "method"), params.getAsJsonObject(), timeout);
+        return new Request(id, requireString(object, "method"), params.getAsJsonObject(), timeout, regexDeadline);
     }
 
     private static JsonObject requireObject(JsonElement element, Set<String> keys) {
@@ -5279,7 +5322,7 @@ public final class ReaGhidraBridge extends HeadlessScript {
         int decompileTimeoutSeconds,
         boolean existingProject
     ) {}
-    private record Request(int id, String method, JsonObject params, Integer decompileTimeoutSeconds) {}
+    private record Request(int id, String method, JsonObject params, Integer decompileTimeoutSeconds, Integer regexMatchingDeadlineMillis) {}
 
     private static final class RequestFailure extends RuntimeException {
         private final String code;
