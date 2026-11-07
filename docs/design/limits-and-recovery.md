@@ -117,6 +117,18 @@ For example, `regex.matching_deadline_ms` and its launch seed
 Changing the runtime setting affects the next accepted search; changing the
 launch environment affects the next REA process.
 
+Ghidra consumes this same deadline for `search_strings` and `search_procedures`
+in regex mode. The accepted value is sent as `regex_matching_deadline_ms` in
+the bridge request envelope. One isolated Java worker owns regex compilation
+and all candidate matches under one deadline, preserving Java regex syntax.
+Provider startup and cold inventory preparation are outside this deadline;
+class extraction and OS process creation are not hard real-time preemptible work. A timeout
+stops that worker, not the Program; without concurrent caller cancellation,
+the session and annotations remain available. Literal search does not use the
+worker. The V8-specific `regex.worker_heap_request_mib` does not apply to Java.
+Worker failure, reported memory exhaustion and unconfirmed cleanup are distinct
+from `regex_timeout`; raising the deadline cannot clear retained cleanup.
+
 [`REA_MCP_MAX_RESPONSE_BYTES`](https://github.com/morluto/rea/blob/main/src/config/mcpResponseBudget.ts)
 is the byte-budget shape: a decimal safe integer with a 10 MiB floor
 (`MINIMUM_RESPONSE_BYTES`), the same shared schema, and no silent fallback. A
