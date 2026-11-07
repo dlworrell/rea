@@ -46,7 +46,7 @@ export interface AppConfig {
   readonly referenceSourcePolicy: ReferenceSourcePolicy;
   /** Hopper and Cutter request payload ceiling resolved at startup. */
   readonly bridgeMaxRequestBytes: BridgeMaxRequestBytes;
-  /** Supervised ECMAScript matching deadline resolved at startup. */
+  /** Supervised ECMAScript/Java regex deadline, read from the operation snapshot. */
   readonly regexMatchingDeadline: RegexMatchingDeadline;
   /** Regex worker old-generation request resolved at startup. */
   readonly regexWorkerHeapRequest: RegexWorkerHeapRequest;
