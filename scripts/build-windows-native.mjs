@@ -67,17 +67,19 @@ const fetchBytes = async (name) => {
   return Buffer.from(await response.arrayBuffer());
 };
 const checksums = (await fetchBytes("SHASUMS256.txt")).toString("utf8");
+// Verify downloaded bytes before they reach disk, so a mismatched download is
+// never cached for a later run (CodeQL js/http-to-file-access).
 const verifiedDownload = async (name, path) => {
-  if (!(await exists(path))) await writeFile(path, await fetchBytes(name));
-  const digest = createHash("sha256")
-    .update(await readFile(path))
-    .digest("hex");
   const expected = checksums
     .split("\n")
     .find((line) => line.slice(66) === name)
     ?.slice(0, 64);
+  const cached = await exists(path);
+  const bytes = cached ? await readFile(path) : await fetchBytes(name);
+  const digest = createHash("sha256").update(bytes).digest("hex");
   if (expected === undefined || digest !== expected)
     throw new Error(`Node build prerequisite SHA-256 mismatch: ${name}`);
+  if (!cached) await writeFile(path, bytes);
 };
 const cachedHeaders = join(
   homedir(),
