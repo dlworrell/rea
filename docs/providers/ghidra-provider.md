@@ -267,6 +267,34 @@ profile stages before retrying their retained descriptors.
 | P-code value flow       | Function dossiers include up to 3,000 high-p-code operations, at most 64 inputs per operation, and 12,000 def-use edges. Results identify memory reads/writes, branches, and calls by p-code opcode, and mark decompiler-dead operations. Large results report truncation, an omitted-operation lower bound, and known omitted-input/edge counts. The dossier is an intra-function graph; `trace_native_values` composes derived parameter/argument and return/output dependencies across resolved calls. It does not resolve memory aliasing, call side effects, runtime behavior, persistent state, or business meaning. |
 | Result extent           | Function instruction scans and native API boundary observations remain complete. P-code flow is the explicit bounded exception; its count fields distinguish exact retained counts from lower-bound or known-omitted counts. Caller cancellation and provider failures remain distinct.                                                                                                                                                                                                                                                                                                                                    |
 
+Regex `search_strings` and `search_procedures` use an isolated Java regex worker
+with one deadline covering regex compilation and all matches. Provider startup
+and cold inventory preparation happen before that deadline. Class extraction
+and OS process creation are not hard real-time, preemptible operations. The existing
+`regex.matching_deadline_ms` setting defaults to 5000 ms and accepts 1 through
+2147483647 ms; `REA_REGEX_MATCHING_DEADLINE_MS` seeds it at launch. Use
+`update_analysis_settings` to change the next accepted search without restarting
+REA. Java regex syntax, case behavior, substring `find()` behavior and complete
+search results are preserved.
+A `regex_timeout` returns no partial search result and stops only the worker,
+preserving the Program and session annotations unless caller cancellation also
+closes the session. The client deadline is separate and unchanged.
+
+`regex_worker_failed`, `regex_worker_memory_exhausted`, and
+`regex_worker_cleanup_failed` identify worker failure, observed memory
+exhaustion, and unconfirmed cleanup respectively. The bridge retains failed
+cleanup ownership and retries it before admitting another regex worker.
+The child heap inherits the admitted Ghidra JVM maximum heap.
+`regex.worker_heap_request_mib` controls V8 workers, not this Java worker.
+Literal search does not start a regex worker. The separate heap is not a
+process-family memory cap: whole-machine memory pressure can still affect the
+Ghidra JVM.
+
+The standalone Java regression checks worker deadlines, protocol semantics,
+termination and cleanup. Real-Ghidra compilation, class loading, session and
+annotation retention, and Windows behavior remain unverified for this draft.
+The real-provider boundary script includes the proposed retention check.
+
 Runtime updates apply to newly accepted operations on the existing Program.
 They preserve accepted budgets and do not clear cleanup blockers or change the
 client deadline. Transient decompile timeout failures remain uncached so the
