@@ -15,7 +15,7 @@ import { readHostFile } from "../../desktop/HostFileRead.js";
 import { PrivateRuntimeRoot } from "../../process/PrivateRuntimeRoot.js";
 
 const START = "start_build_computer";
-const MAX_KEY_BYTES = 1024 * 1024;
+export const MAX_KEY_BYTES = 1024 * 1024;
 
 /** The archive the build layer unpacks REA from, as the operator configured it. */
 const reaPayload = async (
@@ -50,7 +50,7 @@ const reaPayload = async (
  * descriptor and the read is bounded, so a path swapped after a check cannot
  * bypass the size limit or block on a FIFO (CodeQL js/file-system-race).
  */
-const readAptKey = async (path: string): Promise<Buffer> => {
+export const readAptKey = async (path: string): Promise<Buffer> => {
   const refuse = (reason: string, cause?: unknown) =>
     new AnalysisInputError(START, {
       userMessage: `The apt key file ${path} ${reason}.`,
