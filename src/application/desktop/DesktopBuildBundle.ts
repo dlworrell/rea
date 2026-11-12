@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, stat, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 
 import {
@@ -11,6 +11,7 @@ import {
   AnalysisInputError,
 } from "../../domain/analysisErrorCore.js";
 import { AGENTENV_PROVIDER } from "../../desktop/AgentEnvComputerHelper.js";
+import { readHostFile } from "../../desktop/HostFileRead.js";
 import { PrivateRuntimeRoot } from "../../process/PrivateRuntimeRoot.js";
 
 const START = "start_build_computer";
@@ -44,7 +45,11 @@ const reaPayload = async (
   return { kind: "file", path };
 };
 
-/** An apt repository's key file, read whole once it is known to be a small regular file. */
+/**
+ * An apt repository's key file. Its type and size are checked on the open
+ * descriptor and the read is bounded, so a path swapped after a check cannot
+ * bypass the size limit or block on a FIFO (CodeQL js/file-system-race).
+ */
 const readAptKey = async (path: string): Promise<Buffer> => {
   const refuse = (reason: string, cause?: unknown) =>
     new AnalysisInputError(START, {
@@ -52,16 +57,17 @@ const readAptKey = async (path: string): Promise<Buffer> => {
       conformsToInputContract: true,
       ...(cause === undefined ? {} : { cause }),
     });
-  const entry = await stat(path).catch((cause: unknown) => {
-    throw refuse("cannot be read", cause);
-  });
-  if (!entry.isFile() || entry.size > MAX_KEY_BYTES)
+  const bytes = await readHostFile(path, MAX_KEY_BYTES, undefined).catch(
+    (cause: unknown) => {
+      throw refuse("cannot be read", cause);
+    },
+  );
+  if (bytes === "missing") throw refuse("cannot be read");
+  if (bytes === "unreadable")
     throw refuse(
-      `is not a regular file of at most ${String(MAX_KEY_BYTES)} bytes, as a signing key is`,
+      `is not a readable regular file of at most ${String(MAX_KEY_BYTES)} bytes, as a signing key is`,
     );
-  return readFile(path).catch((cause: unknown) => {
-    throw refuse("cannot be read", cause);
-  });
+  return bytes;
 };
 
 /** Write the request's build bundle into a private folder, which the computer's owner removes on close. */

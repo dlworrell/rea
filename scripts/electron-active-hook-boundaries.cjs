@@ -248,12 +248,31 @@ const createElectronActiveBoundaryPatches = ({
       try {
         const fs = require("node:fs");
         const crypto = require("node:crypto");
-        const stat = fs.statSync(filename);
-        if (stat.isFile() && stat.size <= 16 * 1024 * 1024)
-          digest = crypto
-            .createHash("sha256")
-            .update(fs.readFileSync(filename))
-            .digest("hex");
+        // One descriptor for the type check and the bounded read, so a file
+        // swapped or grown after a check is never hashed past the limit
+        // (CodeQL js/file-system-race).
+        const limit = 16 * 1024 * 1024;
+        const fd = fs.openSync(
+          filename,
+          fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0),
+        );
+        try {
+          if (fs.fstatSync(fd).isFile()) {
+            const hash = crypto.createHash("sha256");
+            const chunk = Buffer.alloc(64 * 1024);
+            let total = 0;
+            for (;;) {
+              const read = fs.readSync(fd, chunk, 0, chunk.length, null);
+              if (read === 0) break;
+              total += read;
+              if (total > limit) break;
+              hash.update(chunk.subarray(0, read));
+            }
+            if (total <= limit) digest = hash.digest("hex");
+          }
+        } finally {
+          fs.closeSync(fd);
+        }
       } catch {
         digest = null;
       }

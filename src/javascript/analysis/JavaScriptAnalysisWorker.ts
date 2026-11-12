@@ -1,5 +1,6 @@
 import { analysisErrorWithCancellation } from "../../domain/analysisErrorCancellation.js";
 import { safeParseUtf8Json } from "../../domain/safeJson.js";
+import { readStableFileBytes } from "../../filesystem/readStableFileBytes.js";
 import { analysisSettingLimit } from "../../domain/analysisSettingDefinitions.js";
 import { WorkerFrameSignal } from "../../process/WorkerFrameSignal.js";
 import type {
@@ -7,7 +8,8 @@ import type {
   JavaScriptSemanticFileProjection,
 } from "../../domain/javascript/javascriptSemanticFileProjection.js";
 import { createHash, randomUUID } from "node:crypto";
-import { readFile, rm, stat } from "node:fs/promises";
+import { constants } from "node:fs";
+import { open, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { writeJavaScriptAnalysisSourceTransfer } from "./JavaScriptAnalysisSourceTransfer.js";
 import { StringDecoder } from "node:string_decoder";
@@ -768,26 +770,49 @@ export class JavaScriptAnalysisWorker {
     if (rootPath === undefined)
       throw new TypeError("JavaScript checkpoint has no owned runtime");
     const path = join(rootPath, `${id}.static.json`);
-    const bytes = (await stat(path)).size;
-    if (
-      bytes > DEFAULTS.checkpointBytes ||
-      (expected !== undefined && expected.bytes !== bytes)
-    )
-      throw new AnalysisOutputError(
-        OPERATION,
-        "JavaScript static checkpoint byte count exceeds or differs from its declared budget",
-      );
-    if (bytes * 16 + 4 * MIB > this.#remainingParentHeapBytes() - 64 * MIB)
-      throw new AnalysisResourceConstraintError(
-        OPERATION,
-        "memory",
-        "The parent's remaining heap cannot safely decode the completed JavaScript static checkpoint",
-        { ...this.#limits(), checkpoint_bytes: bytes },
-        {
-          remediationAction: JAVASCRIPT_PARENT_CHECKPOINT_HEAP_REMEDIATION,
-        },
-      );
-    const checkpoint = await readFile(path);
+    // One descriptor for the size checks and the read (CodeQL
+    // js/file-system-race): a checkpoint replaced after it was measured cannot
+    // exceed the budget it was admitted under.
+    const file = await open(
+      path,
+      constants.O_RDONLY |
+        (constants.O_NOFOLLOW ?? 0) |
+        (constants.O_NONBLOCK ?? 0),
+    );
+    let bytes: number;
+    let checkpoint: Buffer;
+    try {
+      const info = await file.stat();
+      if (!info.isFile())
+        throw new AnalysisOutputError(
+          OPERATION,
+          "JavaScript static checkpoint is not a regular file",
+        );
+      bytes = info.size;
+      if (
+        bytes > DEFAULTS.checkpointBytes ||
+        (expected !== undefined && expected.bytes !== bytes)
+      )
+        throw new AnalysisOutputError(
+          OPERATION,
+          "JavaScript static checkpoint byte count exceeds or differs from its declared budget",
+        );
+      if (bytes * 16 + 4 * MIB > this.#remainingParentHeapBytes() - 64 * MIB)
+        throw new AnalysisResourceConstraintError(
+          OPERATION,
+          "memory",
+          "The parent's remaining heap cannot safely decode the completed JavaScript static checkpoint",
+          { ...this.#limits(), checkpoint_bytes: bytes },
+          {
+            remediationAction: JAVASCRIPT_PARENT_CHECKPOINT_HEAP_REMEDIATION,
+          },
+        );
+      checkpoint = await readStableFileBytes(file, path, bytes, {
+        symlinks: "reject",
+      });
+    } finally {
+      await file.close();
+    }
     if (
       expected !== undefined &&
       createHash("sha256").update(checkpoint).digest("hex") !== expected.sha256
