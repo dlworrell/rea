@@ -125,16 +125,31 @@ def _module_identity(target):
     return path, identity, module.GetUUIDString() or None
 
 
+# How long the target may be held at entry waiting for the host's identity
+# acknowledgement. The wait runs before the trace deadline applies, so it needs
+# its own bound: without one, a host that never acknowledges keeps LLDB and the
+# stopped target alive until something outside kills them.
+IDENTITY_ACK_TIMEOUT_SECONDS = 30.0
+
+
 def _wait_for_identity_ack(config):
-    """Hold the target at entry while the host adapter captures its start identity."""
+    """Hold the target at entry while the host adapter captures its start identity.
+
+    Returns the acknowledgement text, or "timeout" when none arrives within
+    IDENTITY_ACK_TIMEOUT_SECONDS. Any value other than "readable" makes the
+    caller kill the target and report target-identity-unavailable.
+    """
     path = config.get("identity_ack_path")
     if not path:
         return
+    deadline = time.monotonic() + IDENTITY_ACK_TIMEOUT_SECONDS
     while True:
         try:
             with open(path, "r") as handle:
                 return handle.read(32).strip()
         except FileNotFoundError:
+            if time.monotonic() >= deadline:
+                return "timeout"
             time.sleep(0.025)
 
 

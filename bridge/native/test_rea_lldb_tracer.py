@@ -608,5 +608,36 @@ class NativeTraceBudgetTests(unittest.TestCase):
                     )
 
 
+class IdentityAckWaitTests(unittest.TestCase):
+    """The entry hold waits for the host's acknowledgement, but not forever."""
+
+    def test_returns_the_acknowledgement_once_written(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "identity.ack")
+            with open(path, "w") as handle:
+                handle.write("readable\n")
+            self.assertEqual(tracer._wait_for_identity_ack({"identity_ack_path": path}), "readable")
+
+    def test_no_acknowledgement_path_means_no_wait(self):
+        self.assertIsNone(tracer._wait_for_identity_ack({}))
+
+    def test_missing_acknowledgement_times_out_as_not_readable(self):
+        clock = [1000.0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "never-written.ack")
+            with patch.object(tracer.time, "monotonic", lambda: clock[0]), patch.object(tracer.time, "sleep", sleep):
+                result = tracer._wait_for_identity_ack({"identity_ack_path": path})
+        self.assertEqual(result, "timeout")
+        self.assertNotEqual(result, "readable")
+        self.assertGreaterEqual(clock[0] - 1000.0, tracer.IDENTITY_ACK_TIMEOUT_SECONDS)
+        self.assertLess(clock[0] - 1000.0, tracer.IDENTITY_ACK_TIMEOUT_SECONDS + 0.05)
+
+
 if __name__ == "__main__":
     unittest.main()
