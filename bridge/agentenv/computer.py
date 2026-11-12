@@ -45,6 +45,10 @@ def _computer(result):
 
 def main(argv: list[str]) -> int:
     protocol = _protocol()
+    if len(argv) < 2:
+        # Keep the protocol even for a usage error: one JSON line, then exit 2.
+        _say(protocol, {"error": "usage: computer.py <bundle folder> [task]"})
+        return 2
     bundle, task = argv[1], argv[2] if len(argv) > 2 else "smoke"
     try:
         from agent_env.bundle import run_bundle
