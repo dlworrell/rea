@@ -261,5 +261,45 @@ class TransportUserinfoTests(unittest.TestCase):
         self.assertEqual(capture.without_userinfo(b"//a\\b@host"), b"//a\\b@host")
 
 
+class OfflineCaptureShutdownTests(unittest.TestCase):
+    """Every path through running() shuts mitmdump down."""
+
+    def run_addon(self, request_path):
+        master = mock.Mock()
+        capture.ctx.options = types.SimpleNamespace(rea_request_path=request_path)
+        capture.ctx.master = master
+        with mock.patch.object(capture.resource, "setrlimit"), \
+                mock.patch.object(capture, "decode", return_value={"records": []}), \
+                mock.patch("sys.stderr"):
+            capture.OfflineCapture().running()
+        return master
+
+    def test_unreadable_requests_still_shut_down(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            malformed = os.path.join(folder, "malformed.json")
+            with open(malformed, "w", encoding="utf-8") as handle:
+                handle.write("{not json")
+            no_reply_path = os.path.join(folder, "no-reply-path.json")
+            with open(no_reply_path, "w", encoding="utf-8") as handle:
+                handle.write("{}")
+            for path in ("", os.path.join(folder, "missing.json"), malformed, no_reply_path):
+                with self.subTest(path=os.path.basename(path) or "empty option"):
+                    self.run_addon(path).shutdown.assert_called_once_with()
+            self.assertEqual(sorted(os.listdir(folder)), ["malformed.json", "no-reply-path.json"])
+
+    def test_readable_request_writes_the_reply_and_shuts_down(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as folder:
+            reply = os.path.join(folder, "reply.json")
+            request = os.path.join(folder, "request.json")
+            with open(request, "w", encoding="utf-8") as handle:
+                json.dump({"reply_path": reply}, handle)
+            self.run_addon(request).shutdown.assert_called_once_with()
+            with open(reply, encoding="ascii") as handle:
+                self.assertEqual(json.load(handle), {"ok": True, "value": {"records": []}})
+
+
 if __name__ == "__main__":
     unittest.main()
