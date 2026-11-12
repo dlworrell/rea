@@ -1,0 +1,77 @@
+name: Process reader (macOS)
+
+# Checks for the Darwin process reader. GitHub-hosted macOS runners,
+# read-only token, no secrets; runs only when the Darwin process reader changes.
+#
+# 1. Unit tests: ProcessRunTokenReaderTests.swift drives the KERN_PROCARGS2
+#    parser, the observation rules and the process-table retry with crafted
+#    bytes and a stubbed sysctl.
+# 2. Smoke test: the production reader, built the way REA builds it
+#    (xcrun swiftc <reader> <main> -o <binary>), reads the run token of a live
+#    process started with REA_PROCESS_RUN_ID.
+
+on:
+  pull_request:
+    paths:
+      - "bridge/process/**"
+      - ".github/workflows/process-reader-macos.yml"
+  push:
+    branches: [main]
+    paths:
+      - "bridge/process/**"
+      - ".github/workflows/process-reader-macos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: process-reader-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  process-reader:
+    name: Darwin process reader (Swift)
+    runs-on: macos-15
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bridge/process
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcrun swiftc --version
+
+      - name: Unit tests
+        run: |
+          xcrun swiftc ProcessRunTokenReader.swift ProcessRunTokenReaderTests.swift -o "$RUNNER_TEMP/procargs-tests"
+          "$RUNNER_TEMP/procargs-tests"
+
+      - name: Smoke test against a live process
+        run: |
+          set -euo pipefail
+          xcrun swiftc ProcessRunTokenReader.swift ProcessRunTokenReaderMain.swift -o "$RUNNER_TEMP/process-run-token-reader"
+          expected="ci-smoke-${GITHUB_RUN_ID}"
+          REA_PROCESS_RUN_ID="$expected" node -e 'setTimeout(() => {}, 120000)' &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          sleep 2
+          out="$("$RUNNER_TEMP/process-run-token-reader" "$pid")"
+          identities="$("$RUNNER_TEMP/process-run-token-reader" --identities "$pid")"
+          echo "run token: $out"
+          echo "identity:  $identities"
+          python3 - "$out" "$identities" "$pid" "$expected" <<'PY'
+          import json, sys
+          tokens, identities, pid, expected = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+          token = json.loads(tokens)["results"][0]
+          identity = json.loads(identities)["results"][0]
+          # Swift's synthesized Encodable leaves nil optionals out instead of writing null.
+          assert (token["pid"], token["state"], token.get("run_id"), token.get("reason")) == (pid, "readable", expected, None), token
+          assert identity["pid"] == pid and identity["state"] == "readable", identity
+          print("smoke test passed")
+          PY
