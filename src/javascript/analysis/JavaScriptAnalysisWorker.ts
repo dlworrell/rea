@@ -115,6 +115,53 @@ type WorkerPrimaryFailure =
     };
 
 /** One sequential owned worker, retained between source files and closed after analysis. */
+/**
+ * Read a static checkpoint through one descriptor for its type and size checks
+ * and the read (CodeQL js/file-system-race): a checkpoint replaced after it was
+ * measured cannot exceed the budget it was admitted under. The path is opened
+ * with O_NOFOLLOW and O_NONBLOCK, so a symlink fails to open (ELOOP) and a FIFO
+ * cannot block. `admit` sees the measured size before anything is read and may
+ * throw to refuse it. The descriptor is closed on every path. Exported for its
+ * tests; JavaScriptAnalysisWorker is its only caller.
+ */
+export const readStaticCheckpointFile = async (
+  path: string,
+  maximumBytes: number,
+  expectedBytes: number | undefined,
+  admit: (bytes: number) => void,
+): Promise<{ readonly bytes: number; readonly checkpoint: Buffer }> => {
+  const file = await open(
+    path,
+    constants.O_RDONLY |
+      (constants.O_NOFOLLOW ?? 0) |
+      (constants.O_NONBLOCK ?? 0),
+  );
+  try {
+    const info = await file.stat();
+    if (!info.isFile())
+      throw new AnalysisOutputError(
+        OPERATION,
+        "JavaScript static checkpoint is not a regular file",
+      );
+    const bytes = info.size;
+    if (
+      bytes > maximumBytes ||
+      (expectedBytes !== undefined && expectedBytes !== bytes)
+    )
+      throw new AnalysisOutputError(
+        OPERATION,
+        "JavaScript static checkpoint byte count exceeds or differs from its declared budget",
+      );
+    admit(bytes);
+    const checkpoint = await readStableFileBytes(file, path, bytes, {
+      symlinks: "reject",
+    });
+    return { bytes, checkpoint };
+  } finally {
+    await file.close();
+  }
+};
+
 export class JavaScriptAnalysisWorker {
   readonly #runId = `rea-javascript-analysis-${randomUUID()}`;
   readonly #runtime: OwnedWorkerRuntime;
@@ -770,49 +817,23 @@ export class JavaScriptAnalysisWorker {
     if (rootPath === undefined)
       throw new TypeError("JavaScript checkpoint has no owned runtime");
     const path = join(rootPath, `${id}.static.json`);
-    // One descriptor for the size checks and the read (CodeQL
-    // js/file-system-race): a checkpoint replaced after it was measured cannot
-    // exceed the budget it was admitted under.
-    const file = await open(
+    const { bytes, checkpoint } = await readStaticCheckpointFile(
       path,
-      constants.O_RDONLY |
-        (constants.O_NOFOLLOW ?? 0) |
-        (constants.O_NONBLOCK ?? 0),
+      DEFAULTS.checkpointBytes,
+      expected?.bytes,
+      (size) => {
+        if (size * 16 + 4 * MIB > this.#remainingParentHeapBytes() - 64 * MIB)
+          throw new AnalysisResourceConstraintError(
+            OPERATION,
+            "memory",
+            "The parent's remaining heap cannot safely decode the completed JavaScript static checkpoint",
+            { ...this.#limits(), checkpoint_bytes: size },
+            {
+              remediationAction: JAVASCRIPT_PARENT_CHECKPOINT_HEAP_REMEDIATION,
+            },
+          );
+      },
     );
-    let bytes: number;
-    let checkpoint: Buffer;
-    try {
-      const info = await file.stat();
-      if (!info.isFile())
-        throw new AnalysisOutputError(
-          OPERATION,
-          "JavaScript static checkpoint is not a regular file",
-        );
-      bytes = info.size;
-      if (
-        bytes > DEFAULTS.checkpointBytes ||
-        (expected !== undefined && expected.bytes !== bytes)
-      )
-        throw new AnalysisOutputError(
-          OPERATION,
-          "JavaScript static checkpoint byte count exceeds or differs from its declared budget",
-        );
-      if (bytes * 16 + 4 * MIB > this.#remainingParentHeapBytes() - 64 * MIB)
-        throw new AnalysisResourceConstraintError(
-          OPERATION,
-          "memory",
-          "The parent's remaining heap cannot safely decode the completed JavaScript static checkpoint",
-          { ...this.#limits(), checkpoint_bytes: bytes },
-          {
-            remediationAction: JAVASCRIPT_PARENT_CHECKPOINT_HEAP_REMEDIATION,
-          },
-        );
-      checkpoint = await readStableFileBytes(file, path, bytes, {
-        symlinks: "reject",
-      });
-    } finally {
-      await file.close();
-    }
     if (
       expected !== undefined &&
       createHash("sha256").update(checkpoint).digest("hex") !== expected.sha256
