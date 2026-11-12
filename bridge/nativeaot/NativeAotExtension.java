@@ -111,8 +111,16 @@ public final class NativeAotExtension {
         }
     }
 
-    /** Inline discovery for the existing loaded-image inspection. */
+    /**
+     * Inline discovery for the existing loaded-image inspection.
+     *
+     * <p>Call {@code analyze} first: it builds the report this summarises. Before
+     * that, there is nothing to summarise, and this throws IllegalStateException
+     * rather than NullPointerException.
+     */
     public JsonObject inspectImage() {
+        if (report == null)
+            throw new IllegalStateException("NativeAOT inspectImage() called before analyze(); there is no report yet.");
         JsonObject summary = new JsonObject();
         summary.addProperty("format", "dotnet-nativeaot");
         for (String key : new String[] { "status", "reason", "header_address", "discovery", "format_major", "format_minor", "method_tables", "derived_memory", "coverage", "diagnostics" })
