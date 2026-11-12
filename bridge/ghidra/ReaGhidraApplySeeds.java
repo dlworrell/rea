@@ -46,7 +46,11 @@ public final class ReaGhidraApplySeeds extends GhidraScript {
         for (String line : new String(bytes, StandardCharsets.UTF_8).split("\n")) {
             if (line.isEmpty()) continue;
             String[] fields = line.split("\t", -1);
-            if (fields.length < 2 || fields.length > 3 || !fields[0].startsWith("0x")) {
+            // REA writes only these kinds (src/ghidra/GhidraAnalysisSeeds.ts). An
+            // unknown kind would be counted in entries but applied by no pass, so
+            // refuse it like any other malformed line.
+            if (fields.length < 2 || fields.length > 3 || !fields[0].startsWith("0x")
+                    || !(fields[1].equals("function") || fields[1].equals("code") || fields[1].equals("label"))) {
                 throw new IllegalArgumentException("REA seed snapshot is malformed");
             }
             Address address;
